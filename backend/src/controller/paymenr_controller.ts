@@ -3,6 +3,8 @@ import { fromPromise } from "neverthrow";
 import { Payment } from "../models/payments.js";
 import { getProvider } from "../providers/index.js";
 import type { paymentProviderName } from "../models/payments.js";
+import crypto from "crypto";
+import { esewaProvider } from "../providers/esewa.js";
 
 const PENDING_EXPIRY_MINUTES = 15;
 
@@ -42,11 +44,15 @@ export const createPayment = async (req: Request, res: Response) => {
     }
 
     const newPayment = createResult.value;
-
     const providerImpl = getProvider(provider);
 
     const providerResult = await fromPromise(
-        providerImpl.createpayment(amount, currency, newPayment._id.toString()),
+        providerImpl.createPayment(
+            amount,
+            currency,
+            newPayment._id.toString(),
+            callbackUrl
+        ),
         (err) => {
             console.log("PROVIDER CREATE ERROR:", err);
             return new Error("Provider Error");
@@ -57,12 +63,7 @@ export const createPayment = async (req: Request, res: Response) => {
         return res.status(500).json({ message: providerResult.error.message });
     }
 
-    const { providerReference, redirectUrl } = providerResult.value as unknown as {
-        providerReference: string;
-        redirectUrl: string;
-    };
-
-    newPayment.providerReference = providerReference;
+    newPayment.providerReference = providerResult.value.providerReference;
 
     const saveResult = await fromPromise(
         newPayment.save(),
@@ -78,7 +79,8 @@ export const createPayment = async (req: Request, res: Response) => {
 
     return res.status(201).json({
         paymentId: newPayment._id,
-        redirectUrl,
+        provider,
+        ...providerResult.value,
     });
 };
 
@@ -155,7 +157,10 @@ export const confirmMockPayment = async (req: Request, res: Response) => {
     const providerImpl = getProvider(payment.provider);
 
     const verifyResult = await fromPromise(
-        providerImpl.verifyPayment(payment.providerReference!),
+        providerImpl.verifyPayment(
+            payment.providerReference!,
+            payment.amount.toString()
+        ),
         (err) => {
             console.log("PROVIDER VERIFY ERROR:", err);
             return new Error("Provider Error");
@@ -187,5 +192,93 @@ export const confirmMockPayment = async (req: Request, res: Response) => {
         paymentId: payment._id,
         status: payment.status,
         callbackUrl: payment.callbackUrl,
+    });
+};
+
+export const getEsewaForm = async (req : Request , res : Response) =>
+{
+    const{paymentId} = req.params;
+
+    const findResult = await fromPromise(
+        Payment.findById(paymentId),
+        (err) => {
+            console.log("PAYMENT FIND ERROR:", err);
+            return new Error("Database Error");
+        }
+    );
+
+    if (findResult.isErr()) {
+        return res.status(500).json({ message: findResult.error.message });
+    }
+
+    const payment = findResult.value;
+
+    if (!payment) {
+        return res.status(404).json({ message: "Payment not found" });
+    }
+
+    if (payment.provider !== "esewa") {
+        return res.status(400).json({ message: "Not an eSewa payment" });
+    }
+
+    if (payment.status !== "pending") {
+        return res.status(400).json({ message: "Payment already resolved" });
+    }
+
+    const form = await esewaProvider.createPayment
+    (
+        payment.amount,
+        payment.currency,
+        payment._id.toString(),
+        payment.callbackUrl
+    );
+
+    return res.json(form);
+}
+
+
+
+export const verifyEsewaCallback = async (req: Request, res: Response) => {
+    const { data } = req.query;
+    if (typeof data !== "string") {
+        return res.status(400).json({ message: "Missing data param" });
+    }
+
+    let decoded: Record<string, string>;
+    try {
+        decoded = JSON.parse(Buffer.from(data, "base64").toString("utf-8"));
+    } catch {
+        return res.status(400).json({ message: "Invalid base64 data" });
+    }
+
+    const signedFieldNames = decoded.signed_field_names;
+    if (typeof signedFieldNames !== "string" || !signedFieldNames.trim()) {
+        return res.status(400).json({ message: "Missing signed field names" });
+    }
+
+    const signedFields = signedFieldNames.split(",");
+    const message = signedFields.map((f) => `${f}=${decoded[f]}`).join(",");
+    const expected = crypto
+        .createHmac("sha256", process.env.ESEWA_SECRET_KEY!)
+        .update(message)
+        .digest("base64");
+
+    if (expected !== decoded.signature) {
+        return res.status(400).json({ message: "Invalid signature" });
+    }
+
+    const payment = await Payment.findById(decoded.transaction_uuid);
+    if (!payment) {
+        return res.status(404).json({ message: "Payment not found" });
+    }
+
+    payment.status = decoded.status === "COMPLETE" ? "success" : "failed";
+    payment.providerResponse = decoded;
+
+    await payment.save();
+
+    return res.json({
+        paymentId: payment._id,
+        status: payment.status,
     });
 };
